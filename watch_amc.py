@@ -54,7 +54,7 @@ def notify(title, message, click_url, priority="urgent", tags="clapper"):
 
 
 def dump_diagnostics(page, label="diag"):
-    """Print AMC's live button labels / inputs / dialog text so selectors can be tuned."""
+    """Print AMC's live buttons / inputs / values / dialog text so selectors can be tuned."""
     print(f"--- DIAG [{label}] ---")
     try:
         btns = [b for b in page.get_by_role("button").all_inner_texts() if b.strip()]
@@ -63,14 +63,14 @@ def dump_diagnostics(page, label="diag"):
         print("BUTTONS: <err>", e)
     try:
         inputs = page.locator("input").evaluate_all(
-            "els => els.map(e => ({ph: e.placeholder, type: e.type, aria: e.getAttribute('aria-label')}))")
+            "els => els.map(e => ({ph: e.placeholder, type: e.type, val: e.value}))")
         print("INPUTS:", inputs[:20])
     except Exception as e:
         print("INPUTS: <err>", e)
     try:
         d = page.locator("dialog[open]")
         if d.count():
-            print("DIALOG TEXT:", repr(d.first.inner_text()[:1500]))
+            print("DIALOG TEXT:", repr(d.first.inner_text()[:2000]))
         else:
             print("DIALOG TEXT: <no open dialog>")
     except Exception as e:
@@ -78,15 +78,27 @@ def dump_diagnostics(page, label="diag"):
     print("--- END DIAG ---")
 
 
+def _wait_count(locator, tries=14, gap=500):
+    """Poll until a locator matches at least one element, or give up."""
+    for _ in range(tries):
+        try:
+            if locator.count():
+                return True
+        except Exception:
+            pass
+        locator.page.wait_for_timeout(gap)
+    return False
+
+
 def handle_cookie_consent(page):
-    """Dismiss AMC's cookie-consent modal. Prefer rejecting non-essential; fall back to accept."""
+    """Dismiss AMC's cookie-consent modal if present. Prefer rejecting non-essential."""
     patterns = [
         r"reject all", r"reject non.?essential", r"decline all", r"^decline$",
         r"continue without accepting", r"only necessary", r"necessary cookies only",
         r"accept all cookies", r"accept all", r"i accept", r"^accept$", r"^agree$",
     ]
     waited = 0
-    while waited < 9000:
+    while waited < 5000:
         for pat in patterns:
             btn = page.get_by_role("button", name=re.compile(pat, re.I))
             if btn.count():
@@ -104,53 +116,51 @@ def handle_cookie_consent(page):
 
 
 def select_theatre(page):
-    """Drive AMC's theatre picker (run AFTER cookie consent is dismissed)."""
+    """Drive AMC's 'Find a Theatre' picker."""
     body = page.inner_text("body").lower()
     if THEATRE_NAME.lower() in body and "select a theatre" not in body:
         return  # a cached session already shows our theatre's showtimes
 
-    # Find the picker's search box. It may auto-open, or need a button click to open.
-    search_sel = ("dialog[open] input, "
-                  "input[placeholder*='city' i], input[placeholder*='zip' i], "
-                  "input[placeholder*='theatre' i], input[type='search']")
-    search = page.locator(search_sel).first
+    # Find & wait for the search box (placeholder: "Search by City, Zip or Theatre").
+    search = page.locator(
+        "dialog[open] input, input[placeholder*='Theatre' i], "
+        "input[placeholder*='city' i], input[placeholder*='zip' i]"
+    ).first
     try:
-        search.wait_for(state="visible", timeout=8000)
+        search.wait_for(state="visible", timeout=10000)
     except Exception:
-        for pat in [r"select a theatre", r"find a theatre", r"change theatre",
-                    r"add a theatre", r"choose a theatre"]:
-            b = page.get_by_role("button", name=re.compile(pat, re.I))
-            if b.count():
-                try:
-                    b.first.click(timeout=4000)
-                except Exception:
-                    pass
-                break
+        b = page.get_by_role("button", name=re.compile(r"select a theatre|find a theatre", re.I))
+        if b.count():
+            try:
+                b.first.click(timeout=4000)
+            except Exception:
+                pass
         search.wait_for(state="visible", timeout=10000)
 
-    # 1) Type into the search box.
+    # 1) Type with REAL keystrokes — fill() does NOT trigger AMC's autocomplete.
     search.click()
-    search.fill("Lincoln Square")
-    page.wait_for_timeout(3000)  # autocomplete populates
+    search.press_sequentially("Lincoln Square", delay=120)
 
-    # 2) Click the autocomplete suggestion naming the theatre.
+    # 2) Wait for the autocomplete suggestion, then click it.
     sugg = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
-    if sugg.count():
-        sugg.first.click()
-        page.wait_for_timeout(3500)  # dialog refreshes to the theatre list
-    else:
+    if not _wait_count(sugg, tries=16, gap=500):   # up to ~8s
         dump_diagnostics(page, "no-autocomplete")
+        return
+    sugg.first.click()
+    page.wait_for_timeout(3500)  # dialog refreshes to the theatre list
 
-    # 3) Select the 1998 Broadway location (unique to Lincoln Sq).
-    target = page.get_by_text(re.compile(re.escape(THEATRE_ADDRESS), re.I))
+    # 3) Select the 1998 Broadway location (unique to Lincoln Sq), scoped to the dialog.
+    dlg = page.locator("dialog[open]")
+    target = dlg.get_by_text(re.compile(re.escape(THEATRE_ADDRESS), re.I))
     if not target.count():
-        target = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
+        target = dlg.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
     if target.count():
         target.first.click()
         page.wait_for_timeout(1200)
 
-    # 4) Continue / view showtimes.
-    cont = page.get_by_role("button", name=re.compile(r"continue|view showtimes|see showtimes|done", re.I))
+    # 4) Confirm (Continue / Select a Theatre / View Showtimes), scoped to the dialog.
+    cont = dlg.get_by_role("button", name=re.compile(
+        r"continue|view showtimes|see showtimes|select a theatre|done|confirm", re.I))
     if cont.count():
         cont.first.click()
     else:
@@ -217,7 +227,7 @@ def main():
         page.set_default_timeout(30000)
         try:
             page.goto(SHOWTIMES_URL, wait_until="domcontentloaded")
-            handle_cookie_consent(page)        # <-- dismiss the consent banner FIRST
+            handle_cookie_consent(page)        # dismiss the consent banner if present
             select_theatre(page)
             page.wait_for_timeout(2000)         # let client-side showtimes settle
 
