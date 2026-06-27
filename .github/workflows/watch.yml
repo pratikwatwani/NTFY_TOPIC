@@ -1,0 +1,48 @@
+name: AMC Odyssey Watcher
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"     # every 5 min (UTC). GitHub may delay/skip runs under load — fine here.
+  workflow_dispatch:          # adds a manual "Run workflow" button for testing
+    inputs:
+      force_test_push:
+        description: "Send a test ntfy push instead of scraping (true/false)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: amc-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Playwright + Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Run watcher
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TARGET_DATE: "2026-08-13"
+          FORCE_TEST_PUSH: ${{ github.event.inputs.force_test_push == 'true' && '1' || '' }}
+        run: python watch_amc.py
+
+      - name: Upload debug screenshot (only if one was saved)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshot
+          path: debug.png
+          if-no-files-found: ignore
+          retention-days: 3
