@@ -78,25 +78,60 @@ def dump_diagnostics(page, label="diag"):
     print("--- END DIAG ---")
 
 
+def handle_cookie_consent(page):
+    """Dismiss AMC's cookie-consent modal. Prefer rejecting non-essential; fall back to accept."""
+    patterns = [
+        r"reject all", r"reject non.?essential", r"decline all", r"^decline$",
+        r"continue without accepting", r"only necessary", r"necessary cookies only",
+        r"accept all cookies", r"accept all", r"i accept", r"^accept$", r"^agree$",
+    ]
+    waited = 0
+    while waited < 9000:
+        for pat in patterns:
+            btn = page.get_by_role("button", name=re.compile(pat, re.I))
+            if btn.count():
+                try:
+                    btn.first.click(timeout=4000)
+                    page.wait_for_timeout(1500)
+                    print(f"Cookie consent: clicked '{pat}'")
+                    return True
+                except Exception:
+                    pass
+        page.wait_for_timeout(1000)
+        waited += 1000
+    print("Cookie consent: no banner found (continuing)")
+    return False
+
+
 def select_theatre(page):
-    """Work WITH AMC's auto-opening 'Find a Theatre' dialog (do not click the button behind it)."""
+    """Drive AMC's theatre picker (run AFTER cookie consent is dismissed)."""
     body = page.inner_text("body").lower()
     if THEATRE_NAME.lower() in body and "select a theatre" not in body:
         return  # a cached session already shows our theatre's showtimes
 
-    # AMC normally auto-opens the picker dialog. If it didn't, open it via the body button.
-    if page.locator("dialog[open]").count() == 0:
-        btn = page.get_by_role("button", name=re.compile(r"select a theatre|find a theatre", re.I))
-        if btn.count():
-            btn.first.click()
-    page.locator("dialog[open]").first.wait_for(state="visible", timeout=20000)
+    # Find the picker's search box. It may auto-open, or need a button click to open.
+    search_sel = ("dialog[open] input, "
+                  "input[placeholder*='city' i], input[placeholder*='zip' i], "
+                  "input[placeholder*='theatre' i], input[type='search']")
+    search = page.locator(search_sel).first
+    try:
+        search.wait_for(state="visible", timeout=8000)
+    except Exception:
+        for pat in [r"select a theatre", r"find a theatre", r"change theatre",
+                    r"add a theatre", r"choose a theatre"]:
+            b = page.get_by_role("button", name=re.compile(pat, re.I))
+            if b.count():
+                try:
+                    b.first.click(timeout=4000)
+                except Exception:
+                    pass
+                break
+        search.wait_for(state="visible", timeout=10000)
 
-    # 1) Type into the dialog's search box.
-    search = page.locator("dialog[open] input").first
-    search.wait_for(state="visible", timeout=15000)
+    # 1) Type into the search box.
     search.click()
     search.fill("Lincoln Square")
-    page.wait_for_timeout(3000)  # let autocomplete populate
+    page.wait_for_timeout(3000)  # autocomplete populates
 
     # 2) Click the autocomplete suggestion naming the theatre.
     sugg = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
@@ -106,7 +141,7 @@ def select_theatre(page):
     else:
         dump_diagnostics(page, "no-autocomplete")
 
-    # 3) In the refreshed list, choose the 1998 Broadway location (unique to Lincoln Sq).
+    # 3) Select the 1998 Broadway location (unique to Lincoln Sq).
     target = page.get_by_text(re.compile(re.escape(THEATRE_ADDRESS), re.I))
     if not target.count():
         target = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
@@ -182,8 +217,9 @@ def main():
         page.set_default_timeout(30000)
         try:
             page.goto(SHOWTIMES_URL, wait_until="domcontentloaded")
+            handle_cookie_consent(page)        # <-- dismiss the consent banner FIRST
             select_theatre(page)
-            page.wait_for_timeout(2000)        # let client-side showtimes settle
+            page.wait_for_timeout(2000)         # let client-side showtimes settle
 
             state, times = detect(page)
             print(f"State: {state}   Times: {times}")
