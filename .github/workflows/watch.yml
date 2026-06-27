@@ -36,7 +36,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TARGET_DATE: "2026-08-13"
           FORCE_TEST_PUSH: ${{ github.event.inputs.force_test_push == 'true' && '1' || '' }}
-        run: python watch_amc.py
+        run: xvfb-run -a python watch_amc.py
 
       - name: Upload debug screenshot (only if one was saved)
         if: always()
