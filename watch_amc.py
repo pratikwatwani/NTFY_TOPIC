@@ -9,6 +9,9 @@ What it DOES:      reads the PUBLIC showtimes page and checks whether the target
                    theatre + format now has any showtimes listed.
 What it does NOT:  sign in, select seats, enter payment, or buy anything.
                    The purchase stays 100% manual — the push just gets you there fast.
+
+NOTE: runs a FULL (non-headless) Chromium under Xvfb to avoid headless-browser
+detection. The workflow must launch it via `xvfb-run -a python watch_amc.py`.
 """
 
 import os
@@ -42,19 +45,13 @@ def notify(title, message, click_url, priority="urgent", tags="clapper"):
         f"{NTFY_SERVER}/{NTFY_TOPIC}",
         data=message.encode("utf-8"),
         method="POST",
-        headers={
-            "Title": title,
-            "Priority": priority,        # urgent = loud + vibrate on the phone
-            "Tags": tags,
-            "Click": click_url,          # tapping the notification opens this URL
-        },
+        headers={"Title": title, "Priority": priority, "Tags": tags, "Click": click_url},
     )
     with urllib.request.urlopen(req, timeout=15) as r:
         print(f"ntfy push sent -> HTTP {r.status}")
 
 
 def dump_diagnostics(page, label="diag"):
-    """Print AMC's live buttons / inputs / values / dialog text so selectors can be tuned."""
     print(f"--- DIAG [{label}] ---")
     try:
         btns = [b for b in page.get_by_role("button").all_inner_texts() if b.strip()]
@@ -69,17 +66,13 @@ def dump_diagnostics(page, label="diag"):
         print("INPUTS: <err>", e)
     try:
         d = page.locator("dialog[open]")
-        if d.count():
-            print("DIALOG TEXT:", repr(d.first.inner_text()[:2000]))
-        else:
-            print("DIALOG TEXT: <no open dialog>")
+        print("DIALOG TEXT:", repr(d.first.inner_text()[:2000]) if d.count() else "<no open dialog>")
     except Exception as e:
         print("DIALOG TEXT: <err>", e)
     print("--- END DIAG ---")
 
 
-def _wait_count(locator, tries=14, gap=500):
-    """Poll until a locator matches at least one element, or give up."""
+def _wait_count(locator, tries=16, gap=500):
     for _ in range(tries):
         try:
             if locator.count():
@@ -91,7 +84,6 @@ def _wait_count(locator, tries=14, gap=500):
 
 
 def handle_cookie_consent(page):
-    """Dismiss AMC's cookie-consent modal if present. Prefer rejecting non-essential."""
     patterns = [
         r"reject all", r"reject non.?essential", r"decline all", r"^decline$",
         r"continue without accepting", r"only necessary", r"necessary cookies only",
@@ -116,12 +108,10 @@ def handle_cookie_consent(page):
 
 
 def select_theatre(page):
-    """Drive AMC's 'Find a Theatre' picker."""
     body = page.inner_text("body").lower()
     if THEATRE_NAME.lower() in body and "select a theatre" not in body:
-        return  # a cached session already shows our theatre's showtimes
+        return
 
-    # Find & wait for the search box (placeholder: "Search by City, Zip or Theatre").
     search = page.locator(
         "dialog[open] input, input[placeholder*='Theatre' i], "
         "input[placeholder*='city' i], input[placeholder*='zip' i]"
@@ -137,19 +127,22 @@ def select_theatre(page):
                 pass
         search.wait_for(state="visible", timeout=10000)
 
-    # 1) Type with REAL keystrokes — fill() does NOT trigger AMC's autocomplete.
+    # Type with real keystrokes; nudge any combobox list open.
     search.click()
-    search.press_sequentially("Lincoln Square", delay=120)
+    search.press_sequentially("Lincoln Square", delay=130)
+    page.wait_for_timeout(1500)
+    try:
+        search.press("ArrowDown")
+    except Exception:
+        pass
 
-    # 2) Wait for the autocomplete suggestion, then click it.
     sugg = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
-    if not _wait_count(sugg, tries=16, gap=500):   # up to ~8s
+    if not _wait_count(sugg, tries=18, gap=500):   # up to ~9s
         dump_diagnostics(page, "no-autocomplete")
         return
     sugg.first.click()
-    page.wait_for_timeout(3500)  # dialog refreshes to the theatre list
+    page.wait_for_timeout(3500)
 
-    # 3) Select the 1998 Broadway location (unique to Lincoln Sq), scoped to the dialog.
     dlg = page.locator("dialog[open]")
     target = dlg.get_by_text(re.compile(re.escape(THEATRE_ADDRESS), re.I))
     if not target.count():
@@ -158,7 +151,6 @@ def select_theatre(page):
         target.first.click()
         page.wait_for_timeout(1200)
 
-    # 4) Confirm (Continue / Select a Theatre / View Showtimes), scoped to the dialog.
     cont = dlg.get_by_role("button", name=re.compile(
         r"continue|view showtimes|see showtimes|select a theatre|done|confirm", re.I))
     if cont.count():
@@ -166,38 +158,26 @@ def select_theatre(page):
     else:
         dump_diagnostics(page, "no-continue")
 
-    page.wait_for_timeout(4500)  # showtimes render
+    page.wait_for_timeout(4500)
 
 
 def detect(page):
-    """
-    Returns one of:
-      ("OPEN", [times])   target theatre + format has showtimes  -> ALERT
-      ("NOT_YET", [])     theatre visible but format absent       (expected pre-open)
-      ("ANOMALY", [])     theatre not found at all                (possible block / selector drift)
-    """
     full = page.inner_text("body")
     if THEATRE_NAME not in full:
         return "ANOMALY", []
-
     lines = [l.strip() for l in full.splitlines() if l.strip()]
     start = next((i for i, l in enumerate(lines) if THEATRE_NAME in l), None)
     if start is None:
         return "ANOMALY", []
-
-    # Scope to this theatre's block: stop at "Nearby Theatres" or the next "AMC ...<number>" header.
     end = len(lines)
     for j in range(start + 1, len(lines)):
         if "Nearby Theatres" in lines[j] or re.match(r"^AMC .+\d", lines[j]):
             end = j
             break
     section = lines[start:end]
-
     fmt_idx = next((k for k, l in enumerate(section) if FORMAT_LABEL.upper() in l.upper()), None)
     if fmt_idx is None:
         return "NOT_YET", []
-
-    # Collect the showtimes listed under the IMAX 70MM block.
     times = []
     for l in section[fmt_idx + 1:]:
         if any(f in l for f in OTHER_FORMATS) and not TIME_RE.search(l):
@@ -207,7 +187,6 @@ def detect(page):
 
 
 def main():
-    # Manual end-to-end pipeline test: send a push and exit (no scraping).
     if FORCE_TEST_PUSH:
         notify("AMC watcher test OK",
                f"Pipeline works. Watching {THEATRE_NAME} / {FORMAT_LABEL} for {TARGET_DATE}.",
@@ -216,32 +195,40 @@ def main():
         return
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        # Full Chromium (headless=False) under Xvfb — much harder to fingerprint than headless shell.
+        browser = p.chromium.launch(
+            headless=False,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
+        )
         ctx = browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-            viewport={"width": 1280, "height": 2000},
+            viewport={"width": 1366, "height": 1000},
             locale="en-US",
+            timezone_id="America/New_York",
+        )
+        ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
         )
         page = ctx.new_page()
         page.set_default_timeout(30000)
         try:
             page.goto(SHOWTIMES_URL, wait_until="domcontentloaded")
-            handle_cookie_consent(page)        # dismiss the consent banner if present
+            handle_cookie_consent(page)
             select_theatre(page)
-            page.wait_for_timeout(2000)         # let client-side showtimes settle
+            page.wait_for_timeout(2000)
 
             state, times = detect(page)
             print(f"State: {state}   Times: {times}")
 
             if state == "OPEN":
                 shown = ", ".join(times[:6])
-                notify(
-                    "ODYSSEY IMAX 70MM IS OPEN",
-                    f"{THEATRE_NAME} — {FORMAT_LABEL} now listed for {TARGET_DATE} "
-                    f"({shown}). Open now and grab H22.",
-                    SHOWTIMES_URL,
-                )
+                notify("ODYSSEY IMAX 70MM IS OPEN",
+                       f"{THEATRE_NAME} — {FORMAT_LABEL} now listed for {TARGET_DATE} "
+                       f"({shown}). Open now and grab H22.",
+                       SHOWTIMES_URL)
             elif state == "ANOMALY":
                 dump_diagnostics(page, "anomaly")
                 page.screenshot(path="debug.png", full_page=True)
