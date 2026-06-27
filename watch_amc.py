@@ -53,37 +53,75 @@ def notify(title, message, click_url, priority="urgent", tags="clapper"):
         print(f"ntfy push sent -> HTTP {r.status}")
 
 
+def dump_diagnostics(page, label="diag"):
+    """Print AMC's live button labels / inputs / dialog text so selectors can be tuned."""
+    print(f"--- DIAG [{label}] ---")
+    try:
+        btns = [b for b in page.get_by_role("button").all_inner_texts() if b.strip()]
+        print("BUTTONS:", btns[:40])
+    except Exception as e:
+        print("BUTTONS: <err>", e)
+    try:
+        inputs = page.locator("input").evaluate_all(
+            "els => els.map(e => ({ph: e.placeholder, type: e.type, aria: e.getAttribute('aria-label')}))")
+        print("INPUTS:", inputs[:20])
+    except Exception as e:
+        print("INPUTS: <err>", e)
+    try:
+        d = page.locator("dialog[open]")
+        if d.count():
+            print("DIALOG TEXT:", repr(d.first.inner_text()[:1500]))
+        else:
+            print("DIALOG TEXT: <no open dialog>")
+    except Exception as e:
+        print("DIALOG TEXT: <err>", e)
+    print("--- END DIAG ---")
+
+
 def select_theatre(page):
-    """Drive AMC's 'Find a Theatre' popup using visible-text locators (resilient to CSS changes)."""
+    """Work WITH AMC's auto-opening 'Find a Theatre' dialog (do not click the button behind it)."""
     body = page.inner_text("body").lower()
     if THEATRE_NAME.lower() in body and "select a theatre" not in body:
-        return  # showtimes for our theatre are already rendering
+        return  # a cached session already shows our theatre's showtimes
 
-    for label in ("Select a Theatre", "Find a Theatre", "Change Theatre", "Select a nearby theatre"):
-        btn = page.get_by_role("button", name=re.compile(label, re.I))
+    # AMC normally auto-opens the picker dialog. If it didn't, open it via the body button.
+    if page.locator("dialog[open]").count() == 0:
+        btn = page.get_by_role("button", name=re.compile(r"select a theatre|find a theatre", re.I))
         if btn.count():
             btn.first.click()
-            break
+    page.locator("dialog[open]").first.wait_for(state="visible", timeout=20000)
 
-    search = page.get_by_placeholder(re.compile("city|zip|name", re.I))
-    if not search.count():
-        search = page.get_by_role("textbox")
-    if search.count():
-        search.first.fill(THEATRE_NAME)
-        page.wait_for_timeout(2500)
+    # 1) Type into the dialog's search box.
+    search = page.locator("dialog[open] input").first
+    search.wait_for(state="visible", timeout=15000)
+    search.click()
+    search.fill("Lincoln Square")
+    page.wait_for_timeout(3000)  # let autocomplete populate
 
-    # Prefer the address match so we never pick "Lincoln, NE", etc.
-    opt = page.get_by_text(re.compile(re.escape(THEATRE_ADDRESS), re.I))
-    if not opt.count():
-        opt = page.get_by_text(re.compile(re.escape(THEATRE_NAME), re.I))
-    if opt.count():
-        opt.first.click()
-        page.wait_for_timeout(1000)
+    # 2) Click the autocomplete suggestion naming the theatre.
+    sugg = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
+    if sugg.count():
+        sugg.first.click()
+        page.wait_for_timeout(3500)  # dialog refreshes to the theatre list
+    else:
+        dump_diagnostics(page, "no-autocomplete")
 
-    cont = page.get_by_role("button", name=re.compile("continue|view showtimes|done", re.I))
+    # 3) In the refreshed list, choose the 1998 Broadway location (unique to Lincoln Sq).
+    target = page.get_by_text(re.compile(re.escape(THEATRE_ADDRESS), re.I))
+    if not target.count():
+        target = page.get_by_text(re.compile(r"AMC Lincoln Square 13", re.I))
+    if target.count():
+        target.first.click()
+        page.wait_for_timeout(1200)
+
+    # 4) Continue / view showtimes.
+    cont = page.get_by_role("button", name=re.compile(r"continue|view showtimes|see showtimes|done", re.I))
     if cont.count():
         cont.first.click()
-    page.wait_for_timeout(3500)
+    else:
+        dump_diagnostics(page, "no-continue")
+
+    page.wait_for_timeout(4500)  # showtimes render
 
 
 def detect(page):
@@ -91,7 +129,7 @@ def detect(page):
     Returns one of:
       ("OPEN", [times])   target theatre + format has showtimes  -> ALERT
       ("NOT_YET", [])     theatre visible but format absent       (expected pre-open)
-      ("ANOMALY", [])     theatre not found at all                (possible IP block / selector drift)
+      ("ANOMALY", [])     theatre not found at all                (possible block / selector drift)
     """
     full = page.inner_text("body")
     if THEATRE_NAME not in full:
@@ -145,7 +183,7 @@ def main():
         try:
             page.goto(SHOWTIMES_URL, wait_until="domcontentloaded")
             select_theatre(page)
-            page.wait_for_timeout(4000)        # let client-side showtimes settle
+            page.wait_for_timeout(2000)        # let client-side showtimes settle
 
             state, times = detect(page)
             print(f"State: {state}   Times: {times}")
@@ -159,13 +197,15 @@ def main():
                     SHOWTIMES_URL,
                 )
             elif state == "ANOMALY":
+                dump_diagnostics(page, "anomaly")
                 page.screenshot(path="debug.png", full_page=True)
-                print("ANOMALY: theatre not found after selection — possible datacenter-IP "
-                      "block or popup-selector change. See debug.png.", file=sys.stderr)
+                print("ANOMALY: theatre not found after selection — see debug.png + DIAG above.",
+                      file=sys.stderr)
             else:
                 print("Not open yet — nothing to do.")
         except Exception as e:
             try:
+                dump_diagnostics(page, "exception")
                 page.screenshot(path="debug.png", full_page=True)
                 print("Saved debug.png", file=sys.stderr)
             except Exception:
